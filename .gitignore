@@ -1,0 +1,3 @@
+*.o
+/profiles
+/get_images
