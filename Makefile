@@ -2,6 +2,7 @@ CC := gcc
 CXX := g++
 
 CPPFLAGS := -g -Wall -Wextra
+CFLAGS :=
 CXXFLAGS := -std=c++11
 OBJCFLAGS :=
 
@@ -24,7 +25,7 @@ all: get_images profiles
 get_images: get_images.o
 	$(CXX) -o $@ $(LDFLAGS) $^
 
-profiles: profiles.o
+profiles: profiles.o util.o
 	$(CXX) -o $@ $(OBJC_LDFLAGS) $^
 
 
@@ -33,6 +34,9 @@ profiles: profiles.o
 
 get_images.o: get_images.cpp $(HEADERS)
 	$(CXX) -c -o $@ $(CPPFLAGS) $(CXXFLAGS) $<
+
+util.o: util.c util.h
+	$(CC) -c -o $@ $(CPPFLAGS) $(CFLAGS) $<
 
 profiles.o: profiles.mm $(HEADERS)
 	$(CXX) -c -o $@ $(CPPFLAGS) $(CXXFLAGS) $(OBJCFLAGS) $<

@@ -6,51 +6,117 @@
 #include <inttypes.h>
 #include <boost/algorithm/string/predicate.hpp>
 
+#include "util.h"
 #include "interfaces.h"
 
 
-char* getPathForPid(pid_t pid) {
-  CFNumberRef value = NULL;
-  CFDictionaryRef attributes = NULL;
-  SecCodeRef code = NULL;
-  CFURLRef path = NULL;
-  CFStringRef posixPath = NULL;
-  OSStatus status;
-  char* ret = NULL;
+// This struct emulates the CFString's in-memory layout.
+typedef struct {
+  void*    ptr1;
+  uint64_t val1;
+  char*    string;
+  uint64_t len;
+} fakeCFString;
 
-  value = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pid);
-  if (value == NULL)
-    goto done;
+// Get the base address of the ConfigurationProfiles framework
+uintptr_t getFrameworkBase() {
+  static const char* kFrameworkPath = "/System/Library/PrivateFrameworks/ConfigurationProfiles.framework";
 
-  attributes = CFDictionaryCreate(kCFAllocatorDefault, (const void **)&kSecGuestAttributePid, (const void **)&value, 1, NULL, NULL);
-  if (attributes == NULL)
-    goto done;
+  auto allLibs = LibraryInfo::getAll();
+  for (const auto& lib : allLibs) {
+    auto path = lib.realImageFilePath();
+    if (boost::algorithm::starts_with(path, kFrameworkPath)) {
+      return lib.imageLoadAddress();
+    }
+  }
 
-  status = SecCodeCopyGuestWithAttributes(NULL, attributes, kSecCSDefaultFlags, &code);
-  if (status)
-    goto done;
-
-  status = SecCodeCopyPath(code, kSecCSDefaultFlags, &path);
-  if (status)
-    goto done;
-
-  posixPath = CFURLCopyFileSystemPath(path, kCFURLPOSIXPathStyle);
-  if (path == NULL)
-    goto done;
-
-  ret = strdup(CFStringGetCStringPtr(posixPath, kCFStringEncodingUTF8));
-
-done:
-  if (posixPath)  CFRelease(posixPath);
-  if (path)       CFRelease(path);
-  if (code)       CFRelease(code);
-  if (attributes) CFRelease(attributes);
-  if (value)      CFRelease(value);
-
-  return ret;
+  return 0;
 }
 
+// Get the OS-specific offset into the ConfigurationProfiles framework.
+ptrdiff_t getInstructionOffset() {
+  // TODO: better way of determining the major/minor/patch version
+  int major = 10, minor = 11, patch = 1;
 
+  if (major != 10) {
+    return 0;
+  }
+
+  switch (minor) {
+  case 11:
+    // Tested on 10.11.1
+    return 0x1f058;
+
+  case 10:
+    // Tested on 10.10.5
+    return 0x1d09b;
+
+  case 9:
+    // Tested on 10.9.5
+    return 0x1ac3c;
+
+  default:
+    return 0;
+  }
+}
+
+// Patch the framework, returning whether or not we could do so.
+bool patchFramework() {
+  static const char* kPatchTarget = "/usr/bin/profiles";
+
+  uintptr_t libStart = getFrameworkBase();
+  if (libStart == 0) {
+    NSLog(@"Framework not found");
+    return false;
+  }
+
+  ptrdiff_t offset = getInstructionOffset();
+  if (offset == 0) {
+    NSLog(@"Unknown OS - can not determine offset");
+    return false;
+  }
+
+  // This is a giant hack.  This instruction is in the `GetCallerType` block, and should be:
+  //    leaq   -0xXXXXXXXX(%rip), %rax
+  // Where the 'X's are the RIP-relative address of the CFString.  As bytes:
+  //    0x48 0x8d 0x05 0xXX 0xXX 0xXX 0xXX
+  uint8_t* instructionOffset = (uint8_t*)(libStart + offset);
+  if ((*(instructionOffset + 0) != 0x48) ||
+      (*(instructionOffset + 1) != 0x8d) ||
+      (*(instructionOffset + 2) != 0x05)) {
+    NSLog(@"Unknown instruction - not continuing");
+    return false;
+  }
+
+  int32_t cfOffset = *(int32_t*)(instructionOffset + 3);
+
+  // Note: we get the address of the CFString by emulating the RIP-relative addressing:
+  //        instruction address + instruction length + offset from instruction
+  //                 |                   |                         |
+  //                 |                   |                         +----+
+  //                 |                   +----------------------+       |
+  //                 +-----------------------------+            |       |
+  //                                               v            v       v
+  fakeCFString *stringPtr = (fakeCFString*)(instructionOffset + 7 + cfOffset);
+
+  // Validate that this string matches what we are expecting to overwrite:
+  if (stringPtr->val1 != 0x7c8 ||
+      stringPtr->len != strlen(kPatchTarget) ||
+      0 != strcmp(stringPtr->string, kPatchTarget)) {
+    NSLog(@"Invalid stringPtr - not continuing");
+    return false;
+  }
+
+  // NOTE: we never free this path, since it lives "forever"
+  char* ourPath = getPathForPid(getpid());
+
+  // Everything looks good!
+  stringPtr->string = ourPath;
+  stringPtr->len = strlen(ourPath);
+  return true;
+}
+
+// Actually call ConfigurationProfiles.framework to get/print all configuration profiles.
 void getAllProfiles(CPProfileManager *mgr) {
   NSSet *profs = [mgr allProfiles:nil];
 
@@ -59,120 +125,24 @@ void getAllProfiles(CPProfileManager *mgr) {
   for (CPProfile* prof in profs) {
     NSLog(@"Profile: %@ - %@",
       [prof profileIdentifier],
-      [prof name]
-      );
+      [prof name]);
   }
-}
-
-bool patchInRegion(uintptr_t start, uintptr_t end) {
-  static const char* kPatchTarget = "/System/Library/PrivateFrameworks/IASUtilities.framework/Versions/A/XPCServices/com.apple.IASUtilities.IASCloudConfigHelper.xpc";
-
-  // Get our path
-  const char* ourPath = getPathForPid(getpid());
-  NSLog(@"Our path = %s", ourPath);
-
-  if (strlen(ourPath) > strlen(kPatchTarget)) {
-    NSLog(@"Do not have enough space for our binary path!");
-    free((void*)ourPath);
-    return false;
-  }
-
-  bool patched = false;
-  for (uintptr_t addr = start; addr < end; addr++) {
-    if (0 == strcmp((char*)addr, kPatchTarget)) {
-      NSLog(@"Found target string at: %p", (void*)addr);
-
-      // Protect
-      auto ret = vm_protect(
-        mach_task_self(),
-        (vm_address_t)addr,
-        (vm_size_t)strlen(ourPath),
-        false,
-        VM_PROT_ALL
-      );
-      if (ret) {
-        NSLog(@"Failed vm_protect @ %p: %d", (void*)addr, ret);
-        continue;
-      }
-
-      // Copy
-      strcpy((char*)addr, ourPath);
-      NSLog(@"Successfully patched path at %p (path = '%s')", (void*)addr, (char*)addr);
-      patched = true;
-      break;
-    }
-  }
-
-  free((void*)ourPath);
-  return patched;
-}
-
-bool patchFramework() {
-  static const char* kFrameworkPath = "/System/Library/PrivateFrameworks/ConfigurationProfiles.framework";
-
-  // Find the 'ConfigurationProfile.framework' library
-  auto allLibs = LibraryInfo::getAll();
-  uintptr_t libStart = 0;
-
-  for (const auto& lib : allLibs) {
-    NSLog(@"[%16lx] %s", lib.imageLoadAddress(), lib.realImageFilePath().c_str());
-
-    auto path = lib.realImageFilePath();
-    if (boost::algorithm::starts_with(path, kFrameworkPath)) {
-      libStart = lib.imageLoadAddress();
-      break;
-    }
-  }
-
-  if (libStart == 0) {
-    NSLog(@"Framework not found");
-    return false;
-  }
-
-  NSLog(@"Framework starts at: %p", (void*)libStart);
-
-  // Get all memory regions.  Note that we don't get subregions - we just want
-  // to find the main region, and then we can search forward from the image
-  // header.
-  auto regions = RegionInfo::getAll(mach_task_self(), false);
-
-  // For each region, if it contains the image's start address, then we print it.
-  for (const auto& info : regions) {
-    NSLog(@"%p - %p [%s] (%d)",
-      (void*)info.start(),
-      (void*)info.end(),
-      info.displaySize().c_str(),
-      info.depth()
-      );
-
-    if (info.start() <= libStart && info.end() >= libStart) {
-      NSLog(@"Found region that contains image: %p - %p", (void*)info.start(), (void*)info.end());
-      return patchInRegion(libStart, info.end());
-    }
-  }
-
-  return false;
 }
 
 int main(void) {
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  NSLog(@"Started");
 
   if (patchFramework()) {
     CPProfileManager *mgr = [CPProfileManager sharedProfileManager];
-    if (!mgr) {
+    if (mgr) {
+      getAllProfiles(mgr);
+    } else {
       NSLog(@"Error creating CPProfileManager");
-      goto cleanup;
     }
-    NSLog(@"mgr = %@", mgr);
-
-    getAllProfiles(mgr);
   } else {
     NSLog(@"Could not patch our path");
   }
 
-cleanup:
-  NSLog(@"Finished");
   [pool drain];
   return 0;
 }
